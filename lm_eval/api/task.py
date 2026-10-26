@@ -22,7 +22,14 @@ from tqdm import tqdm
 from lm_eval import utils
 from lm_eval.api import samplers
 from lm_eval.api.instance import Instance, OutputType
-from lm_eval.api.metrics import bits_per_byte, mean, weighted_perplexity
+from lm_eval.api.metrics import (
+    BINNED_CALIBRATION_METRICS,
+    CALIBRATION_METRICS,
+    bind_calibration_kwargs,
+    bits_per_byte,
+    mean,
+    weighted_perplexity,
+)
 from lm_eval.api.registry import (
     AGGREGATION_REGISTRY,
     DEFAULT_METRIC_REGISTRY,
@@ -737,6 +744,13 @@ class ConfigurableTask(Task):
                         f"aggregation={INV_AGG_REGISTRY[metric_agg]}"
                     )
                     self._aggregation_list[metric_name] = metric_agg
+
+                if metric_name in BINNED_CALIBRATION_METRICS and kwargs:
+                    # These metrics are computed in their aggregation, so that is
+                    # where their options go.
+                    self._aggregation_list[metric_name] = bind_calibration_kwargs(
+                        self._aggregation_list[metric_name], **kwargs
+                    )
 
                 if "higher_is_better" in metric_config:
                     self._higher_is_better[metric_name] = metric_config[
@@ -1565,6 +1579,9 @@ class ConfigurableTask(Task):
                     else {}
                 ),
                 **({"likelihood": (gold, lls)} if "likelihood" in use_metric else {}),
+                **{
+                    m: (gold, prob_norm) for m in CALIBRATION_METRICS if m in use_metric
+                },
             }
 
             if "acc_mutual_info" in use_metric:

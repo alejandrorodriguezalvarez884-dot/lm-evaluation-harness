@@ -1,3 +1,4 @@
+import functools
 import logging
 import math
 import os
@@ -170,6 +171,227 @@ def brier_score(items):  # This is a passthrough function
     aggregation="brier_score",
 )
 def brier_score_fn(items):  # This is a passthrough function
+    return items
+
+
+# Calibration metrics for multiple-choice tasks. As with `brier_score`, each
+# document contributes `(gold, probs)` and the score is computed over the whole
+# dataset in the aggregation, since binning and temperature fitting need every
+# document at once.
+CALIBRATION_METRICS = ("ece", "rms_ce", "brier_score_tt", "rms_ce_tt")
+# The ones that take `n_bins` and `binning` options from `metric_list`.
+BINNED_CALIBRATION_METRICS = ("ece", "rms_ce", "rms_ce_tt")
+_BINNING_SCHEMES = ("equal_width", "equal_mass")
+
+
+def _check_binning(n_bins: int, binning: str) -> None:
+    if not isinstance(n_bins, int) or n_bins < 1:
+        raise ValueError(f"n_bins must be a positive integer, got {n_bins!r}")
+    if binning not in _BINNING_SCHEMES:
+        raise ValueError(f"binning must be one of {_BINNING_SCHEMES}, got {binning!r}")
+
+
+def bind_calibration_kwargs(
+    aggregation: Callable[..., float],
+    n_bins: int = 10,
+    binning: str = "equal_width",
+) -> Callable[..., float]:
+    """Bind `metric_list` options to a calibration aggregation.
+
+    Validating here means a bad option fails when the task is built, not after
+    every document has been scored.
+    """
+    _check_binning(n_bins, binning)
+    return functools.partial(aggregation, n_bins=n_bins, binning=binning)
+
+
+def _top_label(items) -> tuple[np.ndarray, np.ndarray]:
+    """Confidence and correctness of the argmax choice, the one `acc` scores.
+
+    `gold` may be a list of accepted indices. An invalid gold (-100) counts as
+    wrong, as it does for `acc`.
+    """
+    confidences = np.empty(len(items))
+    correct = np.empty(len(items))
+    for i, (gold, probs) in enumerate(items):
+        probs = np.asarray(probs, dtype=float)
+        pred = int(np.argmax(probs))
+        confidences[i] = probs[pred]
+        golds = gold if isinstance(gold, (list, tuple)) else (gold,)
+        correct[i] = float(pred in golds)
+    return confidences, correct
+
+
+def _binned_gaps(
+    confidences: np.ndarray, correct: np.ndarray, n_bins: int, binning: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Weight and |accuracy - confidence| of each non-empty bin."""
+    _check_binning(n_bins, binning)
+    if binning == "equal_width":
+        # Right-closed bins (lo, hi]; the first one also takes 0.
+        inner_edges = np.linspace(0.0, 1.0, n_bins + 1)[1:-1]
+        ids = np.searchsorted(inner_edges, confidences, side="left")
+    else:
+        # Split the sorted confidences into bins whose sizes differ by at most one.
+        order = np.argsort(confidences, kind="stable")
+        ids = np.empty(len(confidences), dtype=int)
+        for b, chunk in enumerate(np.array_split(order, n_bins)):
+            ids[chunk] = b
+    counts = np.bincount(ids, minlength=n_bins)
+    nonempty = counts > 0
+    counts = counts[nonempty]
+    conf_sums = np.bincount(ids, weights=confidences, minlength=n_bins)[nonempty]
+    acc_sums = np.bincount(ids, weights=correct, minlength=n_bins)[nonempty]
+    return counts / len(confidences), np.abs(acc_sums - conf_sums) / counts
+
+
+def _temperature_scaled(items) -> tuple[np.ndarray, np.ndarray]:
+    """Rescale all probabilities with the temperature that minimises the gold NLL.
+
+    The temperature is fit on the evaluated documents themselves. Scaling the
+    log-probabilities is equivalent to scaling the choice loglikelihoods, since
+    softmax ignores the per-document normalising constant.
+
+    Returns an (n_docs, max_choices) array, zero-padded for documents with fewer
+    choices, and the gold indices.
+    """
+    from scipy.optimize import minimize_scalar
+    from scipy.special import logsumexp
+
+    n_choices = max(len(probs) for _, probs in items)
+    # -inf padding keeps missing choices at probability 0 for any temperature.
+    log_probs = np.full((len(items), n_choices), -np.inf)
+    golds = np.empty(len(items), dtype=int)
+    for i, (gold, probs) in enumerate(items):
+        probs = np.asarray(probs, dtype=float)
+        if isinstance(gold, (list, tuple)) or not 0 <= gold < len(probs):
+            raise ValueError(
+                "Temperature-tuned calibration metrics need a single in-range "
+                f"gold index per document; got gold={gold!r} for a document "
+                f"with {len(probs)} choices."
+            )
+        # Keep probabilities that underflowed to 0 finite in log space.
+        log_probs[i, : len(probs)] = np.log(np.clip(probs, np.finfo(float).tiny, None))
+        golds[i] = gold
+    gold_log_probs = log_probs[np.arange(len(golds)), golds]
+
+    def nll(log_beta: float) -> float:
+        beta = np.exp(log_beta)
+        return float(
+            np.mean(logsumexp(beta * log_probs, axis=1) - beta * gold_log_probs)
+        )
+
+    # The NLL is convex in beta = 1/T, hence unimodal in log(beta).
+    result = minimize_scalar(
+        nll,
+        bounds=(np.log(1e-3), np.log(1e3)),
+        method="bounded",
+        options={"xatol": 1e-8},
+    )
+    beta = float(np.exp(result.x))
+    eval_logger.debug(f"Fitted calibration temperature T={1 / beta:.4f}")
+
+    scaled = beta * log_probs
+    scaled -= scaled.max(axis=1, keepdims=True)
+    tempered = np.exp(scaled)
+    return tempered / tempered.sum(axis=1, keepdims=True), golds
+
+
+@register_aggregation("ece")
+def ece(items, n_bins: int = 10, binning: str = "equal_width") -> float:
+    """Expected calibration error of the top-label confidence.
+
+    ECE = sum_b (|B_b| / N) * |acc(B_b) - conf(B_b)|, where the confidence is
+    the probability of the predicted choice. Guo et al., "On Calibration of
+    Modern Neural Networks", ICML 2017. https://arxiv.org/abs/1706.04599
+
+    Args:
+        items: `(gold, probs)` pairs, one per document.
+        n_bins: Number of bins.
+        binning: "equal_width" (bins of width 1/n_bins) or "equal_mass" (bins
+            holding the same number of documents).
+    """
+    weights, gaps = _binned_gaps(*_top_label(items), n_bins, binning)
+    return float(np.sum(weights * gaps))
+
+
+@register_aggregation("rms_ce")
+def rms_ce(items, n_bins: int = 10, binning: str = "equal_width") -> float:
+    """Root-mean-square calibration error of the top-label confidence.
+
+    RMS-CE = sqrt(sum_b (|B_b| / N) * (acc(B_b) - conf(B_b))^2), which weighs
+    large gaps more than ECE. Used for MMLU in Hendrycks et al., "Measuring
+    Massive Multitask Language Understanding", ICLR 2021.
+    https://arxiv.org/abs/2009.03300
+
+    Takes the same arguments as `ece`.
+    """
+    weights, gaps = _binned_gaps(*_top_label(items), n_bins, binning)
+    return float(np.sqrt(np.sum(weights * gaps**2)))
+
+
+@register_aggregation("brier_score_tt")
+def brier_score_tt(items) -> float:
+    """Brier score after rescaling with one temperature fit on the evaluated documents.
+
+    Measures the miscalibration that a single global temperature cannot fix.
+    """
+    probs, golds = _temperature_scaled(items)
+    one_hot = np.zeros_like(probs)
+    one_hot[np.arange(len(golds)), golds] = 1.0
+    return float(np.mean(np.sum((probs - one_hot) ** 2, axis=1)))
+
+
+@register_aggregation("rms_ce_tt")
+def rms_ce_tt(items, n_bins: int = 10, binning: str = "equal_width") -> float:
+    """RMS calibration error after the same temperature fit as `brier_score_tt`.
+
+    Takes the same arguments as `ece`.
+    """
+    probs, golds = _temperature_scaled(items)
+    # A positive temperature keeps the argmax, so correctness is unchanged.
+    correct = (probs.argmax(axis=1) == golds).astype(float)
+    weights, gaps = _binned_gaps(probs.max(axis=1), correct, n_bins, binning)
+    return float(np.sqrt(np.sum(weights * gaps**2)))
+
+
+@register_metric(
+    metric="ece",
+    higher_is_better=False,
+    output_type=["multiple_choice"],
+    aggregation="ece",
+)
+def ece_fn(items):  # This is a passthrough function
+    return items
+
+
+@register_metric(
+    metric="rms_ce",
+    higher_is_better=False,
+    output_type=["multiple_choice"],
+    aggregation="rms_ce",
+)
+def rms_ce_fn(items):  # This is a passthrough function
+    return items
+
+
+@register_metric(
+    metric="brier_score_tt",
+    higher_is_better=False,
+    output_type=["multiple_choice"],
+    aggregation="brier_score_tt",
+)
+def brier_score_tt_fn(items):  # This is a passthrough function
+    return items
+
+
+@register_metric(
+    metric="rms_ce_tt",
+    higher_is_better=False,
+    output_type=["multiple_choice"],
+    aggregation="rms_ce_tt",
+)
+def rms_ce_tt_fn(items):  # This is a passthrough function
     return items
 
 

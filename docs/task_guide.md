@@ -235,6 +235,30 @@ Metrics:
 - `bleu`
 - `chrf`
 - `ter`
+- `brier_score` (multiple choice only)
+- `ece`, `rms_ce`, `brier_score_tt`, `rms_ce_tt` (calibration, multiple choice only; see below)
+
+#### Calibration metrics
+
+For `multiple_choice` tasks, these metrics score how well the model's confidence matches its accuracy. The probabilities are the softmax over the choice loglikelihoods, so the predicted choice is the one `acc` scores. All four are computed over the whole dataset (lower is better):
+
+- `ece`: expected calibration error of the top-label confidence ([Guo et al., 2017](https://arxiv.org/abs/1706.04599)).
+- `rms_ce`: root-mean-square calibration error, which weighs large gaps more ([Hendrycks et al., 2021](https://arxiv.org/abs/2009.03300)).
+- `brier_score_tt`, `rms_ce_tt`: Brier score and RMS calibration error after rescaling all probabilities with the single temperature that minimises the negative log-likelihood on the evaluated documents. This is an in-sample (oracle) fit: it shows how much miscalibration a global temperature cannot fix.
+
+`ece`, `rms_ce` and `rms_ce_tt` take `n_bins` (default `10`) and `binning` (`equal_width`, the default, or `equal_mass`, where every bin holds the same number of documents):
+
+```yaml
+metric_list:
+  - metric: acc
+  - metric: ece
+    n_bins: 15
+  - metric: rms_ce
+    binning: equal_mass
+  - metric: brier_score_tt
+```
+
+No standard error is reported for these metrics. A group's `aggregate_metric_list` combines them like any other metric, as a (by default size-weighted) mean of the per-subtask values, not by recomputing them over the pooled documents.
 
 Aggregation functions:
 
